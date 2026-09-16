@@ -1,6 +1,10 @@
 /target
 /resultados
 
+# Configuração local do teste. Crie a sua com:
+#   cp config.exemplo.toml config.toml
+config.toml
+
 # Documentos de trabalho, fora do controle de versão
 Projeto.md
 Prompt.md
