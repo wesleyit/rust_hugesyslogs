@@ -270,6 +270,30 @@ pub fn imprimir_tabelas(
         );
     }
 
+    // ---- Origem e relay ----
+    if !ag.origens.is_empty() {
+        println!();
+        println!("=== ORIGEM x RELAY (cadeia vista pelo receptor) ===");
+        println!(
+            "{:<20} {:<20} {:>12} {:>9}",
+            "origem (emissor)", "relay (encaminhou)", "mensagens", "fatia"
+        );
+        for ((origem, relay), n) in &ag.origens {
+            let fatia = if resumo.recebidas > 0 {
+                *n as f64 / resumo.recebidas as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "{:<20} {:<20} {:>12} {:>9}",
+                origem,
+                relay,
+                num(*n),
+                pct(fatia)
+            );
+        }
+    }
+
     // ---- Avisos ----
     let mut avisos: Vec<String> = Vec::new();
     for e in envios {
@@ -391,6 +415,23 @@ pub fn montar_json(
         })
         .collect();
 
+    let origens: Vec<_> = ag
+        .origens
+        .iter()
+        .map(|((origem, relay), n)| {
+            json!({
+                "origem": origem,
+                "relay": relay,
+                "mensagens": n,
+                "fatia_pct": if resumo.recebidas > 0 {
+                    *n as f64 / resumo.recebidas as f64 * 100.0
+                } else {
+                    0.0
+                },
+            })
+        })
+        .collect();
+
     json!({
         "resumo": {
             "janela_s": resumo.janela_s,
@@ -405,6 +446,7 @@ pub fn montar_json(
         },
         "receptores": receptores,
         "geradores": geradores,
+        "origens": origens,
         "conferencia": {
             "disponivel": conf.disponivel,
             "recebidas_relay": conf.recebidas_relay,

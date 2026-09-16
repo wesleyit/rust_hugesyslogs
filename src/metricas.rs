@@ -45,6 +45,8 @@ pub struct Agregado {
     pub receptores: Vec<EstatReceptor>,
     pub total_recebidas: u64,
     pub recebidas_por_gerador: BTreeMap<String, u64>,
+    /// Contagem por par (origem, relay), como visto pelos receptores.
+    pub origens: BTreeMap<(String, String), u64>,
     /// Mensagens descartadas por caírem na janela de aquecimento.
     pub descartadas_aquecimento: u64,
     /// Linhas que não puderam ser interpretadas.
@@ -55,24 +57,34 @@ pub struct Agregado {
 
 struct Campos<'a> {
     gerador: &'a str,
+    origem: &'a str,
+    relay: &'a str,
     envio_ns: i128,
 }
 
 fn extrair(corpo: &str) -> Option<Campos<'_>> {
     let mut gerador = None;
+    let mut origem = "?";
+    let mut relay = "?";
     let mut envio_ns = None;
     for token in corpo.split_ascii_whitespace() {
         if let Some(v) = token.strip_prefix("g=") {
             gerador = Some(v);
         } else if let Some(v) = token.strip_prefix("t=") {
             envio_ns = v.parse::<i128>().ok();
-        }
-        if gerador.is_some() && envio_ns.is_some() {
+        } else if let Some(v) = token.strip_prefix("origem=") {
+            origem = v;
+        } else if let Some(v) = token.strip_prefix("relay=") {
+            relay = v;
+        } else if gerador.is_some() && envio_ns.is_some() {
+            // O padding vem depois dos campos de medição; nada mais a procurar.
             break;
         }
     }
     Some(Campos {
         gerador: gerador?,
+        origem,
+        relay,
         envio_ns: envio_ns?,
     })
 }
@@ -157,6 +169,9 @@ pub fn coletar(
             ag.total_recebidas += 1;
             *ag.recebidas_por_gerador
                 .entry(campos.gerador.to_string())
+                .or_insert(0) += 1;
+            *ag.origens
+                .entry((campos.origem.to_string(), campos.relay.to_string()))
                 .or_insert(0) += 1;
         }
 

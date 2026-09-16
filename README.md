@@ -345,6 +345,19 @@ A             udp  90,00%      675.001      675.001            0 (0,00%)
 
 Permite isolar perdas por protocolo — típico em UDP sob carga alta.
 
+### Origem x relay
+
+```
+=== ORIGEM x RELAY (cadeia vista pelo receptor) ===
+origem (emissor)     relay (encaminhou)      mensagens     fatia
+gen-A                hsb-relay                  22.400    70,00%
+gen-B                hsb-relay                   9.600    30,00%
+```
+
+Mostra a cadeia completa **como o receptor a enxerga**: quem produziu o log e quem o
+encaminhou. Útil para confirmar que o HOSTNAME original sobreviveu ao salto pelo relay e,
+em topologias com mais de um relay, para ver por qual deles cada mensagem passou.
+
 ### Avisos
 
 Bloco `=== AVISOS ===`, exibido só quando há algo a reportar:
@@ -400,31 +413,43 @@ ambiente real.
 Cada mensagem é um frame RFC5424 com os campos de medição no **início** do corpo:
 
 ```
-<134>1 2026-09-16T12:00:00.000000Z A hsb - - - g=A s=4211 t=1758024000123456789 AAAA...
-                                                 \_ gerador, sequência, envio _/  \pad/
+<134>1 2026-09-16T12:00:00.000000Z gen-A hsb - - - g=A s=4211 t=1758024000123456789 AAAA...
+                                   \_HOSTNAME_/         \_ gerador, sequência, envio _/ \pad/
 ```
 
-O receptor grava **só os primeiros 90 caracteres** do corpo, descartando o padding:
+O campo `HOSTNAME` recebe o **hostname real do container** que emitiu a mensagem (`gen-A`,
+`gen-B`, …). O relay encaminha com `template="RSYSLOG_SyslogProtocol23Format"`, que é RFC5424 e
+**preserva o HOSTNAME original** em vez de sobrescrevê-lo com o nome do próprio relay.
+
+No receptor, as duas pontas da cadeia ficam disponíveis em propriedades distintas do rsyslog:
+
+| Propriedade  | Significado                                                                 |
+| ------------ | --------------------------------------------------------------------------- |
+| `%hostname%` | quem **produziu** o log — o emissor original, preservado ao longo da cadeia |
+| `%fromhost%` | quem **encaminhou** — o peer imediato da conexão, ou seja, o relay          |
+
+O receptor grava as duas, mais os primeiros 90 caracteres do corpo, descartando o padding:
 
 ```rsyslog
 template(name="hsb" type="string"
-         string="%timegenerated:::date-rfc3339% %msg:1:90%\n")
+         string="%timegenerated:::date-rfc3339% origem=%hostname% relay=%fromhost% %msg:1:90%\n")
 ```
 
 Resultado: cada linha do log tem tamanho fixo, **independente do `tamanho_mensagem`**. Testar com
 mensagens de 8 KB não transforma o disco em gargalo.
 
 ```
-2026-09-16T12:00:00.124312-03:00 g=A s=4211 t=1758024000123456789
+2026-09-16T20:59:48.310910+00:00 origem=gen-A relay=hsb-relay g=A s=0 t=1789592388087502621
 ```
 
-| Métrica       | Origem                                                                             |
-| ------------- | ---------------------------------------------------------------------------------- |
-| Balanceamento | contagem de linhas de cada `recv-N.log`                                            |
-| Latência      | `timegenerated` do rsyslog menos o `t` do gerador, num histograma HDR por receptor |
-| Throughput    | total recebido ÷ duração útil                                                      |
-| Perda         | `enviadas` (JSON dos geradores) menos recebidas, por gerador                       |
-| Conferência   | `impstats` do relay                                                                |
+| Métrica               | Origem                                                                             |
+| --------------------- | ---------------------------------------------------------------------------------- |
+| Balanceamento         | contagem de linhas de cada `recv-N.log`                                            |
+| Latência              | `timegenerated` do rsyslog menos o `t` do gerador, num histograma HDR por receptor |
+| Throughput            | total recebido ÷ duração útil                                                      |
+| Perda                 | `enviadas` (JSON dos geradores) menos recebidas, por gerador                       |
+| Cadeia origem → relay | `%hostname%` e `%fromhost%` de cada linha                                          |
+| Conferência           | `impstats` do relay                                                                |
 
 Os containers compartilham o clock do kernel do host, então comparar os dois carimbos é válido
 sem nenhuma sincronização de relógio.

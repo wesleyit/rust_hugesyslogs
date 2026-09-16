@@ -39,10 +39,13 @@ pub fn conf_receptor(cfg: &Config, indice: usize) -> String {
 
     s.push_str(&format!("input(type=\"imtcp\" port=\"{PORTA_TLS}\")\n\n"));
 
-    // Só os primeiros 90 caracteres do corpo: descarta o padding e mantém a linha
-    // com tamanho fixo, independente de teste.tamanho_mensagem.
+    // %hostname% e o emissor original, preservado pelo relay; %fromhost% e o peer
+    // imediato, ou seja, quem encaminhou. So os primeiros 90 caracteres do corpo:
+    // descarta o padding e mantem a linha com tamanho fixo.
     s.push_str("template(name=\"hsb\" type=\"string\"\n");
-    s.push_str("         string=\"%timegenerated:::date-rfc3339% %msg:1:90%\\n\")\n\n");
+    s.push_str(
+        "         string=\"%timegenerated:::date-rfc3339% origem=%hostname% relay=%fromhost% %msg:1:90%\\n\")\n\n",
+    );
 
     s.push_str(&format!(
         "action(type=\"omfile\" file=\"/out/recv-{indice}.log\" template=\"hsb\"\n\
@@ -97,6 +100,8 @@ pub fn conf_relay(cfg: &Config) -> String {
     s.push_str(&format!("    target=[{alvos}]\n"));
     s.push_str(&format!("    port=\"{PORTA_TLS}\"\n"));
     s.push_str("    protocol=\"tcp\"\n");
+    // RFC5424 no encaminhamento preserva o HOSTNAME original do emissor.
+    s.push_str("    template=\"RSYSLOG_SyslogProtocol23Format\"\n");
     s.push_str("    StreamDriver=\"gtls\"\n");
     s.push_str("    StreamDriverMode=\"1\"\n");
     s.push_str(&format!("    StreamDriverAuthMode=\"{auth}\"\n"));

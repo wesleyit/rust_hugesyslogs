@@ -35,6 +35,9 @@ pub struct ArgsGerador {
     /// Tamanho do frame syslog em bytes, sem o `\n` do TCP.
     #[arg(long)]
     pub tamanho: usize,
+    /// Nome gravado no campo HOSTNAME. Padrão: o hostname do próprio container.
+    #[arg(long)]
+    pub origem: Option<String>,
     #[arg(long, default_value_t = 60.0)]
     pub duracao: f64,
     #[arg(long, default_value_t = 0.0)]
@@ -50,6 +53,7 @@ pub struct ArgsGerador {
 #[derive(Serialize)]
 pub struct RelatorioGerador {
     pub nome: String,
+    pub origem: String,
     pub proto: String,
     pub taxa_alvo: u64,
     pub threads: usize,
@@ -71,6 +75,15 @@ fn agora_ns() -> i128 {
         .unwrap_or(0)
 }
 
+/// Hostname do container, usado como origem da mensagem.
+fn hostname_do_sistema() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "desconhecido".to_string())
+}
+
 pub fn executar(args: ArgsGerador) -> Result<()> {
     let endereco = args
         .alvo
@@ -80,6 +93,10 @@ pub fn executar(args: ArgsGerador) -> Result<()> {
         .with_context(|| format!("o alvo {:?} não resolveu para nenhum endereço", args.alvo))?;
 
     let threads = args.threads.max(1);
+    let origem = args
+        .origem
+        .clone()
+        .unwrap_or_else(hostname_do_sistema);
     let sequencia = Arc::new(AtomicU64::new(0));
     let parar = Arc::new(AtomicBool::new(false));
 
@@ -114,12 +131,14 @@ pub fn executar(args: ArgsGerador) -> Result<()> {
         };
 
         let args = args.clone();
+        let origem = origem.clone();
         let sequencia = Arc::clone(&sequencia);
         let parar = Arc::clone(&parar);
 
         handles.push(std::thread::spawn(move || {
             trabalhar(
                 &args,
+                &origem,
                 endereco,
                 taxa_thread,
                 cota_total,
@@ -154,6 +173,7 @@ pub fn executar(args: ArgsGerador) -> Result<()> {
 
     let relatorio = RelatorioGerador {
         nome: args.nome.clone(),
+        origem: origem.clone(),
         proto: args.proto.texto().to_string(),
         taxa_alvo: args.taxa,
         threads,
@@ -179,8 +199,8 @@ pub fn executar(args: ArgsGerador) -> Result<()> {
         .with_context(|| format!("não foi possível gravar {}", destino.display()))?;
 
     eprintln!(
-        "gerador {}: {} mensagens em {:.1}s ({:.0} msg/s), {} erros",
-        args.nome, enviadas_total, decorrido, relatorio.taxa_real, erros
+        "gerador {} (origem {}): {} mensagens em {:.1}s ({:.0} msg/s), {} erros",
+        args.nome, origem, enviadas_total, decorrido, relatorio.taxa_real, erros
     );
     Ok(())
 }
@@ -230,6 +250,7 @@ impl Canal {
 #[allow(clippy::too_many_arguments)]
 fn trabalhar(
     args: &ArgsGerador,
+    origem: &str,
     endereco: std::net::SocketAddr,
     taxa: u64,
     cota: u64,
@@ -294,7 +315,7 @@ fn trabalhar(
             }
             let seq = sequencia.fetch_add(1, Ordering::Relaxed);
             let agora = agora_ns();
-            montar(&mut quadro, args, seq, agora, &enchimento);
+            montar(&mut quadro, args, origem, seq, agora, &enchimento);
 
             match canal.enviar(&quadro) {
                 Ok(n) => {
@@ -326,14 +347,21 @@ fn trabalhar(
 
 /// Monta um frame RFC5424 com exatamente `args.tamanho` bytes.
 ///
-/// Os campos de medição vêm no início do corpo para caberem no recorte
-/// `%msg:1:90%` que o receptor grava.
-fn montar(quadro: &mut String, args: &ArgsGerador, seq: u64, agora: i128, enchimento: &str) {
+/// `origem` vai no campo HOSTNAME, que o relay preserva ao encaminhar. Os campos de
+/// medição vêm no início do corpo para caberem no recorte `%msg:1:90%` do receptor.
+fn montar(
+    quadro: &mut String,
+    args: &ArgsGerador,
+    origem: &str,
+    seq: u64,
+    agora: i128,
+    enchimento: &str,
+) {
     quadro.clear();
     let ts = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
     let _ = write!(
         quadro,
-        "<134>1 {ts} {nome} hsb - - - g={nome} s={seq} t={agora}",
+        "<134>1 {ts} {origem} hsb - - - g={nome} s={seq} t={agora}",
         nome = args.nome
     );
 
