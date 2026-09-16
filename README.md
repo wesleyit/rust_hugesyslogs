@@ -253,6 +253,20 @@ Durações aceitam `"500ms"`, `"60s"`, `"5m"`, `"1h"` ou um número puro (segund
 O modo `anon` criptografa o tráfego sem verificar nada — é o mais simples e o padrão. O
 `certvalid` existe como alternativa caso o build de GnuTLS não ofereça ciphersuites anônimas.
 
+Os dois cifram com a mesma força; o que muda é a autenticação:
+
+|                   | `anon` (padrão)         | `certvalid`                   |
+| ----------------- | ----------------------- | ----------------------------- |
+| Cifra negociada   | `ADH-AES256-GCM-SHA384` | AES-256-GCM com certificado   |
+| Autenticação      | **nenhuma**             | cadeia validada (não o nome)  |
+| Resistente a MITM | não                     | sim                           |
+| Versão TLS        | fixo em **1.2**         | permite 1.3                   |
+| Certificados      | nenhum, em lugar nenhum | um, montado só nos receptores |
+
+> O *Anonymous Diffie-Hellman* foi **removido do TLS 1.3**, então o modo `anon` fica
+> necessariamente em TLS 1.2. Se precisar de TLS 1.3 ou de proteção contra
+> man-in-the-middle, use `certvalid`.
+
 ### `[[gerador]]`
 
 Cada bloco é **um container**. Declare quantos quiser, misturando TCP e UDP.
@@ -490,7 +504,46 @@ configuração rsyslog — rode `hugesyslogs validar` para ver o diagnóstico do
 
 **Avisos `CA certificate is not set` nos logs dos receptores**
 Esperado no modo `anon` e inofensivo. São três avisos informativos; o listener sobe e opera
-normalmente.
+normalmente. No ADH não existe certificado nenhum — é justamente esse o ponto.
+
+**`openssl s_client` na porta 6514 parece indicar que não há TLS**
+
+Sintoma típico:
+
+```
+$ openssl s_client -connect localhost:6514
+SSL handshake has read 0 bytes and written 1540 bytes
+no peer certificate available
+New, (NONE), Cipher is (NONE)
+```
+
+**Isso não significa texto puro.** Repare que o `openssl` *escreveu* o ClientHello e leu
+**zero bytes**: o servidor rejeitou e fechou. É a assinatura de *no shared cipher*. Em texto
+puro o rsyslog engoliria o ClientHello como se fosse uma mensagem e manteria a conexão aberta.
+
+A causa é que o modo `anon` usa *Anonymous Diffie-Hellman* e o **OpenSSL não oferece
+ciphersuites anônimas por padrão**. Habilitando-as, o handshake fecha normalmente:
+
+```bash
+openssl s_client -connect recv-1:6514 -tls1_2 -cipher 'ADH:@SECLEVEL=0'
+# New, TLSv1.2, Cipher is ADH-AES256-GCM-SHA384
+```
+
+Ou, com o cliente nativo do GnuTLS:
+
+```bash
+gnutls-cli --priority "NORMAL:+ANON-ECDH:+ANON-DH" --insecure --port 6514 recv-1
+# - Handshake was completed
+```
+
+Para conferir a criptografia de forma independente do cliente, capture o tráfego e procure um
+marcador conhecido das mensagens — o padding é uma sequência de `A`:
+
+```bash
+podman exec <receptor> tcpdump -i any -s 0 -w /out/cap.pcap port 6514   # em outro terminal
+podman exec <receptor> sh -c "tcpdump -r /out/cap.pcap -A | grep -c 'AAAA'"
+# 0  ->  o tráfego está cifrado
+```
 
 **Sobrou container de uma execução interrompida**
 ```bash

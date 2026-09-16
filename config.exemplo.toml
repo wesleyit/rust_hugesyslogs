@@ -19,10 +19,13 @@ rebind_interval = 0        # 0 = desliga a reconexão periódica do omfwd
 quantidade = 4
 
 [tls]
-# anon      -> criptografa sem verificar nada, nenhum certificado em lugar algum
+# anon      -> criptografa sem verificar nada, nenhum certificado em lugar algum.
+#              Negocia ADH-AES256-GCM-SHA384. Como o Anonymous Diffie-Hellman foi
+#              removido do TLS 1.3, este modo fica necessariamente em TLS 1.2 e
+#              nao protege contra man-in-the-middle.
 # certvalid -> receptores apresentam um certificado self-signed e o relay valida
-#              apenas a cadeia (não o nome). Plano B caso o build de GnuTLS
-#              não ofereça ciphersuites anônimas.
+#              apenas a cadeia (nao o nome). Use quando precisar de TLS 1.3, de
+#              autenticacao, ou se o build de GnuTLS nao oferecer cifras anonimas.
 modo = "anon"
 
 # ---- Geradores: um bloco = um container ----
