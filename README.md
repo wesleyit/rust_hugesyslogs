@@ -24,6 +24,7 @@ desvio máximo: 0,00%   ->  BALANCEADO
 
 - [O que a ferramenta responde](#o-que-a-ferramenta-responde)
 - [Como funciona](#como-funciona)
+  - [Os dois modos de distribuição](#os-dois-modos-de-distribuição)
 - [Requisitos](#requisitos)
 - [Instalação](#instalação)
 - [Uso](#uso)
@@ -79,6 +80,7 @@ flowchart LR
 | ------------------------ | --------------------------------------------------------------- |
 | Receptores               | container rsyslog (`imtcp` + `gtls`)                            |
 | Relay                    | container rsyslog (`imtcp` + `imudp` + `omfwd` com target pool) |
+| Balanceador (opcional)   | container nginx L4 (`stream`), no lugar do relay                |
 | Geradores                | binário Rust, um container por gerador                          |
 | Orquestração e relatório | binário Rust, rodando no host                                   |
 
@@ -88,10 +90,50 @@ rsyslog distribui entre todos os alvos online, removendo os indisponíveis autom
 Todos os containers ficam numa rede podman dedicada e se resolvem pelo nome. **Nenhuma porta é
 publicada no host** e nenhuma porta privilegiada é usada.
 
-| Perna              | Porta | Protocolo |
-| ------------------ | ----- | --------- |
-| geradores → relay  | 5514  | TCP e UDP |
-| relay → receptores | 6514  | TCP + TLS |
+Cada receptor sobe **três listeners**, e o campo `transporte=` de cada mensagem registra por
+qual deles ela entrou:
+
+| Porta      | Uso                                    |
+| ---------- | -------------------------------------- |
+| `6514/tcp` | TLS — usado pelo relay rsyslog         |
+| `5514/tcp` | texto puro — usado pelo balanceador L4 |
+| `5514/udp` | texto puro — usado pelo balanceador L4 |
+
+### Os dois modos de distribuição
+
+Esta é a razão de ser da ferramenta. A mesma carga, distribuída de duas formas diferentes:
+
+|                      | padrão (relay rsyslog) | `--balanceador` (nginx L4)      |
+| -------------------- | ---------------------- | ------------------------------- |
+| Unidade distribuída  | **mensagem**           | **conexão**                     |
+| Critério             | round-robin do `omfwd` | hash de **5 tuplas**            |
+| Quando decide        | a cada mensagem        | uma vez, no handshake           |
+| Perna até o receptor | TCP + TLS na 6514      | TCP/UDP em texto puro na 5514   |
+| Resultado típico     | distribuição uniforme  | **desbalanceamento deliberado** |
+
+No modo balanceador o nginx opera em **camada 4 pura**: não interpreta syslog, não termina TLS,
+apenas repassa bytes. O hash usa `$remote_addr$remote_port` — como o IP e a porta de destino e o
+protocolo são constantes nesta topologia, três dos cinco elementos da 5-tupla não variam, então
+hashear origem e porta de origem **é** o hash de 5 tuplas aqui.
+
+A consequência prática: cada thread de cada gerador tem seu próprio socket, logo sua própria
+conexão, logo **fica presa a um único receptor** durante todo o teste. Com poucas conexões e
+muitos receptores, sobram receptores ociosos — que é justamente o efeito a observar.
+
+```
+# 4 conexões, 3 receptores
+receptor    conexões    mensagens     fatia  quais
+recv-1             2       16.000    50,00%  A/1 B/1
+recv-2             2       16.000    50,00%  A/0 B/0
+recv-3             0            0     0,00%  —
+desvio máximo: 33,33%   ->  DESBALANCEADO
+```
+
+| Perna                    | Porta | Protocolo        |
+| ------------------------ | ----- | ---------------- |
+| geradores → relay/LB     | 5514  | TCP e UDP        |
+| relay → receptores       | 6514  | TCP + TLS        |
+| balanceador → receptores | 5514  | TCP e UDP, plain |
 
 ---
 
@@ -168,11 +210,12 @@ normalmente não o invoca à mão.
 
 #### Opções úteis
 
-| Opção                | Efeito                                                                                              |
-| -------------------- | --------------------------------------------------------------------------------------------------- |
-| `--config <arquivo>` | Caminho do TOML. Padrão: `config.toml`.                                                             |
-| `--imagem <tag>`     | Tag da imagem. Padrão: `localhost/hugesyslogs:latest`.                                              |
-| `--manter`           | Não remove os containers ao final, para inspecionar logs e estado. Lembre de rodar `limpar` depois. |
+| Opção                | Efeito                                                                                                                                  |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `--config <arquivo>` | Caminho do TOML. Padrão: `config.toml`.                                                                                                 |
+| `--imagem <tag>`     | Tag da imagem. Padrão: `localhost/hugesyslogs:latest`.                                                                                  |
+| `--manter`           | Não remove os containers ao final, para inspecionar logs e estado. Lembre de rodar `limpar` depois.                                     |
+| `--balanceador`      | Troca o relay rsyslog por um **balanceador nginx L4 de 5 tuplas**, em texto puro. Veja [os dois modos](#os-dois-modos-de-distribuição). |
 
 ### Fluxo típico
 
@@ -185,6 +228,13 @@ $EDITOR config.toml
 ./target/release/hugesyslogs executar
 ```
 
+Para comparar os dois mecanismos de distribuição com a **mesma carga**, rode em sequência:
+
+```bash
+./target/release/hugesyslogs executar --config config.toml                 # relay rsyslog
+./target/release/hugesyslogs executar --config config.toml --balanceador   # nginx L4
+```
+
 ### O que acontece durante a execução
 
 A ordem importa: se os geradores subissem antes do relay, as primeiras mensagens se perderiam e
@@ -193,9 +243,9 @@ contaminariam a medição de perda.
 ```
 [1/8] cria a rede podman
 [2/8] gera o certificado                (só no modo certvalid)
-[3/8] gera os .conf e valida com rsyslogd -N1
-[4/8] sobe os receptores                -> espera a porta 6514 abrir
-[5/8] sobe o relay                      -> espera as portas 5514 TCP e UDP abrirem
+[3/8] gera os .conf e valida com rsyslogd -N1 (e nginx -t, se --balanceador)
+[4/8] sobe os receptores                -> espera as portas abrirem
+[5/8] sobe o relay OU o balanceador     -> espera as portas 5514 TCP e UDP abrirem
 [6/8] sobe os geradores                 -> aquecimento + duração
 [7/8] espera os geradores, drena as filas, para relay e receptores
 [8/8] monta o relatório e remove tudo
@@ -218,7 +268,7 @@ sair. Um segundo Ctrl-C força a saída imediata (aí pode sobrar container — 
 | `duracao`          | duração | obrigatório | Por quanto tempo os geradores injetam carga.                                   |
 | `aquecimento`      | duração | `0s`        | Janela inicial descartada das métricas, para o sistema estabilizar.            |
 | `drenagem`         | duração | `10s`       | Espera após parar os geradores, para a fila do relay esvaziar.                 |
-| `tamanho_mensagem` | inteiro | `512`       | Bytes do frame syslog, sem o `\n` do TCP. Mínimo 128.                          |
+| `tamanho_mensagem` | inteiro | `512`       | Bytes do frame syslog, sem o `\n` do TCP. Mínimo 192.                          |
 | `taxa`             | inteiro | obrigatório | Mensagens por segundo **no total**, repartidas entre os geradores pelos pesos. |
 | `threads`          | inteiro | `4`         | Threads por gerador. Cada thread tem seu próprio socket.                       |
 | `total_mensagens`  | inteiro | `0`         | Teto absoluto de mensagens. `0` = ilimitado, usa só a `duracao`.               |
@@ -372,6 +422,38 @@ Mostra a cadeia completa **como o receptor a enxerga**: quem produziu o log e qu
 encaminhou. Útil para confirmar que o HOSTNAME original sobreviveu ao salto pelo relay e,
 em topologias com mais de um relay, para ver por qual deles cada mensagem passou.
 
+### Conexões por receptor — a tabela que explica o porquê
+
+```
+=== CONEXÕES POR RECEPTOR (pares gerador/thread distintos) ===
+receptor    conexões    mensagens     fatia  quais
+recv-1             2       16.000    50,00%  A/1 B/1
+recv-2             2       16.000    50,00%  A/0 B/0
+recv-3             0            0     0,00%  —
+```
+
+A tabela de balanceamento mostra **que** houve desvio; esta mostra **por quê**. A coluna `quais`
+lista os pares `gerador/thread` que aquele receptor viu.
+
+A leitura muda conforme o modo:
+
+- **relay rsyslog** — todos os receptores veem **todas** as conexões, porque o round-robin
+  espalha mensagem a mensagem. Conexões iguais em todos os nós é sinal de saúde.
+- **balanceador L4** — cada conexão aparece em **exatamente um** receptor, e é aí que os
+  ociosos ficam evidentes.
+
+### Por transporte
+
+```
+=== POR TRANSPORTE ===
+transporte      mensagens     fatia
+tcp                 9.600    30,00%
+udp                22.400    70,00%
+```
+
+Diz por qual listener as mensagens entraram. No modo padrão aparece `tls` com 100%; no modo
+balanceador, a divisão entre `tcp` e `udp` em texto puro.
+
 ### Avisos
 
 Bloco `=== AVISOS ===`, exibido só quando há algo a reportar:
@@ -392,6 +474,9 @@ Vem do `impstats` do próprio rsyslog, como fonte **independente** da contagem f
 receptores. Se os dois números divergirem muito, desconfie da medição. Estes contadores são
 cumulativos e **incluem o aquecimento**, então não batem com a linha `enviadas` do resumo — isso
 é esperado.
+
+> No modo `--balanceador` esta seção **não aparece**: o `impstats` é do rsyslog e o nginx não tem
+> equivalente. A conferência cruzada se perde nesse modo.
 
 ---
 
@@ -427,43 +512,53 @@ ambiente real.
 Cada mensagem é um frame RFC5424 com os campos de medição no **início** do corpo:
 
 ```
-<134>1 2026-09-16T12:00:00.000000Z gen-A hsb - - - g=A s=4211 t=1758024000123456789 AAAA...
-                                   \_HOSTNAME_/         \_ gerador, sequência, envio _/ \pad/
+<134>1 2026-09-17T12:00:00.000000Z gen-A hsb - - - gerador=A thread=1 sequencia=4211 envio_ns=1758024000123456789 AAAA...
+                                   \_HOSTNAME_/    \_____________ campos de medição _____________/ \pad/
 ```
+
+| Campo       | Significado                                                       |
+| ----------- | ----------------------------------------------------------------- |
+| `gerador`   | nome lógico do gerador, como declarado no `[[gerador]]`           |
+| `thread`    | índice da thread — **identifica a conexão** sob um balanceador L4 |
+| `sequencia` | número de sequência, contínuo por gerador                         |
+| `envio_ns`  | instante do envio, em nanossegundos desde o epoch                 |
 
 O campo `HOSTNAME` recebe o **hostname real do container** que emitiu a mensagem (`gen-A`,
 `gen-B`, …). O relay encaminha com `template="RSYSLOG_SyslogProtocol23Format"`, que é RFC5424 e
 **preserva o HOSTNAME original** em vez de sobrescrevê-lo com o nome do próprio relay.
 
-No receptor, as duas pontas da cadeia ficam disponíveis em propriedades distintas do rsyslog:
+No receptor, as pontas da cadeia ficam disponíveis em propriedades distintas do rsyslog:
 
-| Propriedade  | Significado                                                                 |
-| ------------ | --------------------------------------------------------------------------- |
-| `%hostname%` | quem **produziu** o log — o emissor original, preservado ao longo da cadeia |
-| `%fromhost%` | quem **encaminhou** — o peer imediato da conexão, ou seja, o relay          |
+| Propriedade   | Significado                                                                 |
+| ------------- | --------------------------------------------------------------------------- |
+| `%hostname%`  | quem **produziu** o log — o emissor original, preservado ao longo da cadeia |
+| `%fromhost%`  | quem **encaminhou** — o peer imediato, ou seja, o relay ou o balanceador    |
+| `%inputname%` | por qual **listener** entrou: `tls`, `tcp` ou `udp`                         |
 
-O receptor grava as duas, mais os primeiros 90 caracteres do corpo, descartando o padding:
+O receptor grava as três, mais o início do corpo, descartando o padding:
 
 ```rsyslog
 template(name="hsb" type="string"
-         string="%timegenerated:::date-rfc3339% origem=%hostname% relay=%fromhost% %msg:1:90%\n")
+         string="%timegenerated:::date-rfc3339% origem=%hostname% relay=%fromhost% transporte=%inputname% %msg:1:120%\n")
 ```
 
 Resultado: cada linha do log tem tamanho fixo, **independente do `tamanho_mensagem`**. Testar com
 mensagens de 8 KB não transforma o disco em gargalo.
 
 ```
-2026-09-16T20:59:48.310910+00:00 origem=gen-A relay=hsb-relay g=A s=0 t=1789592388087502621
+2026-09-17T13:05:03.124312+00:00 origem=gen-A relay=hsb-lb transporte=udp gerador=A thread=2 sequencia=4211 envio_ns=1789592388087502621
 ```
 
-| Métrica               | Origem                                                                             |
-| --------------------- | ---------------------------------------------------------------------------------- |
-| Balanceamento         | contagem de linhas de cada `recv-N.log`                                            |
-| Latência              | `timegenerated` do rsyslog menos o `t` do gerador, num histograma HDR por receptor |
-| Throughput            | total recebido ÷ duração útil                                                      |
-| Perda                 | `enviadas` (JSON dos geradores) menos recebidas, por gerador                       |
-| Cadeia origem → relay | `%hostname%` e `%fromhost%` de cada linha                                          |
-| Conferência           | `impstats` do relay                                                                |
+| Métrica               | Origem                                                                       |
+| --------------------- | ---------------------------------------------------------------------------- |
+| Balanceamento         | contagem de linhas de cada `recv-N.log`                                      |
+| Latência              | `timegenerated` do rsyslog menos o `envio_ns` do gerador, num histograma HDR |
+| Throughput            | total recebido ÷ duração útil                                                |
+| Perda                 | `enviadas` (JSON dos geradores) menos recebidas, por gerador                 |
+| Cadeia origem → relay | `%hostname%` e `%fromhost%` de cada linha                                    |
+| Conexões por receptor | pares `(gerador, thread)` distintos vistos em cada `recv-N.log`              |
+| Transporte            | `%inputname%`, revelando por qual listener cada mensagem entrou              |
+| Conferência           | `impstats` do relay (indisponível no modo balanceador)                       |
 
 Os containers compartilham o clock do kernel do host, então comparar os dois carimbos é válido
 sem nenhuma sincronização de relógio.
@@ -474,6 +569,16 @@ sem nenhuma sincronização de relógio.
 
 **Descobrir o teto de throughput.** Suba `taxa` até a perda sair de zero ou o aviso de gerador
 lento aparecer.
+
+**Comparar distribuição por mensagem x por conexão.** A mesma config, nos dois modos:
+
+```bash
+hugesyslogs executar --config config.toml                 # round-robin por mensagem
+hugesyslogs executar --config config.toml --balanceador   # hash de 5 tuplas por conexão
+```
+
+Compare o **desvio máximo** e a tabela de **conexões por receptor**. Aumentar `threads` eleva o
+número de conexões e faz a distribuição do balanceador convergir; reduzir agrava o desequilíbrio.
 
 **Testar desbalanceamento de entrada.** Pesos muito assimétricos (`90/3/1/6`) verificam se a
 distribuição na saída continua uniforme mesmo com a entrada torta.
@@ -578,6 +683,7 @@ src/
 ├── config.rs           # leitura do TOML, validação, normalização dos pesos
 ├── certs.rs            # certificado self-signed via openssl
 ├── rsyslog.rs          # geração das confs do relay e dos receptores
+├── balanceador.rs      # geração da conf do nginx L4 de 5 tuplas
 ├── podman.rs           # wrapper fino sobre a CLI do podman
 ├── orquestrador.rs     # ciclo de vida: subir, esperar, parar, drenar
 ├── gerador.rs          # modo gerador: TCP/UDP, controle de taxa, threads

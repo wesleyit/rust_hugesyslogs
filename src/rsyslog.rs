@@ -4,14 +4,20 @@
 
 use crate::config::{Config, ModoTls};
 
-/// Porta que os geradores usam para falar com o relay (TCP e UDP).
+/// Porta que os geradores usam para falar com o relay ou com o balanceador (TCP e UDP).
 pub const PORTA_ENTRADA: u16 = 5514;
 /// Porta TLS que o relay usa para falar com os receptores.
 pub const PORTA_TLS: u16 = 6514;
+/// Porta em texto puro dos receptores, usada pelo balanceador L4.
+pub const PORTA_PLAIN: u16 = 5514;
 
 const DIR_CERTS: &str = "/etc/hsb/certs";
 
 /// Configuração de um receptor do pool.
+///
+/// Sempre expõe três listeners: TLS (usado pelo relay rsyslog) e TCP/UDP em texto
+/// puro (usados quando o balanceador L4 está no lugar do relay). O nome de cada
+/// input vira a propriedade `inputname`, que o template grava como `transporte=`.
 ///
 /// `indice` é 1-based e casa com o nome DNS `recv-N` dentro da rede podman.
 pub fn conf_receptor(cfg: &Config, indice: usize) -> String {
@@ -31,20 +37,31 @@ pub fn conf_receptor(cfg: &Config, indice: usize) -> String {
     }
     s.push_str(")\n\n");
 
-    // AuthMode "anon" no receptor significa: não exigir certificado do cliente.
-    s.push_str("module(load=\"imtcp\"\n");
-    s.push_str("       StreamDriver.Name=\"gtls\"\n");
-    s.push_str("       StreamDriver.Mode=\"1\"\n");
-    s.push_str("       StreamDriver.AuthMode=\"anon\")\n\n");
+    // O StreamDriver fica no input, nao no modulo: se ficasse no modulo, o
+    // listener em texto puro tambem tentaria TLS.
+    s.push_str("module(load=\"imtcp\")\n\n");
+    s.push_str(&format!(
+        "input(type=\"imtcp\" port=\"{PORTA_TLS}\" name=\"tls\"\n\
+         \x20     StreamDriver.Name=\"gtls\"\n\
+         \x20     StreamDriver.Mode=\"1\"\n\
+         \x20     StreamDriver.AuthMode=\"anon\")\n\n"
+    ));
+    s.push_str(&format!(
+        "input(type=\"imtcp\" port=\"{PORTA_PLAIN}\" name=\"tcp\")\n\n"
+    ));
 
-    s.push_str(&format!("input(type=\"imtcp\" port=\"{PORTA_TLS}\")\n\n"));
+    s.push_str("module(load=\"imudp\")\n");
+    s.push_str(&format!(
+        "input(type=\"imudp\" port=\"{PORTA_PLAIN}\" name=\"udp\" rcvbufSize=\"16m\")\n\n"
+    ));
 
     // %hostname% e o emissor original, preservado pelo relay; %fromhost% e o peer
-    // imediato, ou seja, quem encaminhou. So os primeiros 90 caracteres do corpo:
-    // descarta o padding e mantem a linha com tamanho fixo.
+    // imediato, ou seja, quem encaminhou; %inputname% diz por qual porta entrou.
+    // Recortar o corpo mantem a linha com tamanho fixo, independente do
+    // tamanho_mensagem configurado.
     s.push_str("template(name=\"hsb\" type=\"string\"\n");
     s.push_str(
-        "         string=\"%timegenerated:::date-rfc3339% origem=%hostname% relay=%fromhost% %msg:1:90%\\n\")\n\n",
+        "         string=\"%timegenerated:::date-rfc3339% origem=%hostname% relay=%fromhost% transporte=%inputname% %msg:1:120%\\n\")\n\n",
     );
 
     s.push_str(&format!(

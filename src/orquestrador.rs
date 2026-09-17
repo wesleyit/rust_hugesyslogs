@@ -15,6 +15,34 @@ use crate::relatorio::{self, EnvioGerador};
 use crate::rsyslog::{self, PORTA_ENTRADA};
 use crate::{INTERROMPIDO, PREFIXO, REDE};
 
+/// Quem fica no meio do caminho entre geradores e receptores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Distribuicao {
+    /// Relay rsyslog: round-robin **por mensagem**, encaminhando por TLS.
+    Rsyslog,
+    /// Balanceador nginx L4: hash de 5 tuplas **por conexao**, em texto puro.
+    Balanceador,
+}
+
+impl Distribuicao {
+    pub fn texto(self) -> &'static str {
+        match self {
+            Distribuicao::Rsyslog => "rsyslog",
+            Distribuicao::Balanceador => "balanceador",
+        }
+    }
+    /// Apelido DNS do container do meio, tambem gravado no campo `relay=`.
+    fn apelido(self) -> &'static str {
+        match self {
+            Distribuicao::Rsyslog => "relay",
+            Distribuicao::Balanceador => "lb",
+        }
+    }
+    fn container(self) -> String {
+        format!("{PREFIXO}{}", self.apelido())
+    }
+}
+
 /// Estrutura de diretórios de uma execução.
 pub struct Execucao {
     pub id: String,
@@ -56,13 +84,25 @@ fn checar_interrupcao() -> Result<()> {
     Ok(())
 }
 
-/// Grava as configurações rsyslog e as submete a `rsyslogd -N1` dentro da imagem.
-pub fn gerar_e_validar_confs(cfg: &Config, exec: &Execucao, imagem: &str) -> Result<()> {
+/// Grava as configurações e as submete aos validadores nativos.
+///
+/// As confs rsyslog passam por `rsyslogd -N1`. A do nginx **não** é validada aqui:
+/// ele resolve os nomes do upstream ao carregar, então só dá para testá-la depois
+/// que os receptores estiverem de pé — o que acontece em `validar_nginx`.
+pub fn gerar_e_validar_confs(
+    cfg: &Config,
+    exec: &Execucao,
+    imagem: &str,
+    distribuicao: Distribuicao,
+) -> Result<()> {
     let relay = rsyslog::conf_relay(cfg);
     std::fs::write(exec.conf.join("relay.conf"), &relay)?;
     for i in 1..=cfg.receptores.quantidade {
         let c = rsyslog::conf_receptor(cfg, i);
         std::fs::write(exec.conf.join(format!("recv-{i}.conf")), &c)?;
+    }
+    if distribuicao == Distribuicao::Balanceador {
+        std::fs::write(exec.conf.join("lb.conf"), crate::balanceador::conf_nginx(cfg))?;
     }
 
     if !podman::imagem_existe(imagem) {
@@ -80,7 +120,11 @@ pub fn gerar_e_validar_confs(cfg: &Config, exec: &Execucao, imagem: &str) -> Res
     }
 
     // Basta validar o relay e um receptor: os demais são idênticos a menos do índice.
-    for arquivo in ["relay.conf", "recv-1.conf"] {
+    let mut arquivos = vec!["recv-1.conf"];
+    if distribuicao == Distribuicao::Rsyslog {
+        arquivos.push("relay.conf");
+    }
+    for arquivo in arquivos {
         let caminho = exec.conf.join(arquivo);
         let mut cmd = std::process::Command::new("podman");
         cmd.arg("run")
@@ -135,7 +179,12 @@ fn esperar_porta(
     )
 }
 
-pub fn executar(cfg: &Config, imagem: &str, manter: bool) -> Result<()> {
+pub fn executar(
+    cfg: &Config,
+    imagem: &str,
+    manter: bool,
+    distribuicao: Distribuicao,
+) -> Result<()> {
     if !podman::disponivel() {
         bail!("o podman não está disponível no PATH");
     }
@@ -146,11 +195,15 @@ pub fn executar(cfg: &Config, imagem: &str, manter: bool) -> Result<()> {
     let plano = cfg.plano();
     let exec = Execucao::criar(&cfg.saida.diretorio)?;
     println!("Execução {} em {}", exec.id, exec.raiz.display());
+    println!("Distribuição: {}", match distribuicao {
+        Distribuicao::Rsyslog => "relay rsyslog, round-robin por mensagem, TLS",
+        Distribuicao::Balanceador => "balanceador nginx L4, hash de 5 tuplas por conexão, texto puro",
+    });
 
     // Sobras de uma execução anterior atrapalhariam os nomes dos containers.
     limpar(false);
 
-    let resultado = rodar_ciclo(cfg, &plano, &exec, imagem);
+    let resultado = rodar_ciclo(cfg, &plano, &exec, imagem, distribuicao);
 
     if !manter {
         println!("\n[8/8] Removendo containers e rede...");
@@ -167,6 +220,7 @@ fn rodar_ciclo(
     plano: &[GeradorPlano],
     exec: &Execucao,
     imagem: &str,
+    distribuicao: Distribuicao,
 ) -> Result<()> {
     // ---- 1. Rede ----
     println!("\n[1/8] Criando a rede {REDE}...");
@@ -174,18 +228,21 @@ fn rodar_ciclo(
     checar_interrupcao()?;
 
     // ---- 2. Certificado ----
-    println!("[2/8] Certificado ({:?})...", cfg.tls.modo);
-    if cfg.tls.modo == ModoTls::Certvalid {
+    let usa_tls = distribuicao == Distribuicao::Rsyslog;
+    println!("[2/8] Certificado...");
+    if usa_tls && cfg.tls.modo == ModoTls::Certvalid {
         crate::certs::gerar(&exec.certs)?;
         println!("  · certificado self-signed gerado");
-    } else {
+    } else if usa_tls {
         println!("  · modo anon: nenhum certificado necessário");
+    } else {
+        println!("  · balanceador L4 em texto puro: TLS fora do caminho");
     }
     checar_interrupcao()?;
 
-    // ---- 3. Configurações rsyslog ----
-    println!("[3/8] Gerando e validando as configurações rsyslog...");
-    gerar_e_validar_confs(cfg, exec, imagem)?;
+    // ---- 3. Configurações ----
+    println!("[3/8] Gerando e validando as configurações...");
+    gerar_e_validar_confs(cfg, exec, imagem, distribuicao)?;
     checar_interrupcao()?;
 
     // ---- 4. Receptores ----
@@ -211,51 +268,85 @@ fn rodar_ciclo(
     }
     for i in 1..=cfg.receptores.quantidade {
         let container = format!("{PREFIXO}recv-{i}");
+        let (porta, udp, oque) = if usa_tls {
+            (rsyslog::PORTA_TLS, false, "a porta TLS")
+        } else {
+            (rsyslog::PORTA_PLAIN, false, "a porta TCP em texto puro")
+        };
         esperar_porta(
             &container,
-            rsyslog::PORTA_TLS,
-            false,
+            porta,
+            udp,
             Duration::from_secs(30),
-            &format!("o receptor recv-{i} abrir a porta TLS"),
+            &format!("o receptor recv-{i} abrir {oque}"),
         )
         .map_err(|e| diagnosticar(e, &container))?;
     }
-    println!("  · todos os receptores escutando na porta TLS");
+    println!("  · todos os receptores escutando (tls 6514, tcp 5514, udp 5514)");
 
-    // ---- 5. Relay ----
-    println!("[5/8] Subindo o relay...");
-    let mut montagens_relay = vec![
-        Montagem::leitura(exec.conf.join("relay.conf"), "/etc/hsb/relay.conf"),
-        Montagem::escrita(&exec.out, "/out"),
-    ];
-    if cfg.tls.modo == ModoTls::Certvalid {
-        montagens_relay.push(Montagem::leitura(&exec.certs, "/etc/hsb/certs"));
+    // ---- 5. Relay ou balanceador ----
+    let container_meio = distribuicao.container();
+    let apelido_meio = distribuicao.apelido();
+
+    match distribuicao {
+        Distribuicao::Rsyslog => {
+            println!("[5/8] Subindo o relay rsyslog...");
+            let mut montagens = vec![
+                Montagem::leitura(exec.conf.join("relay.conf"), "/etc/hsb/relay.conf"),
+                Montagem::escrita(&exec.out, "/out"),
+            ];
+            if cfg.tls.modo == ModoTls::Certvalid {
+                montagens.push(Montagem::leitura(&exec.certs, "/etc/hsb/certs"));
+            }
+            podman::subir(
+                &container_meio,
+                imagem,
+                REDE,
+                apelido_meio,
+                &montagens,
+                &comando_rsyslog("/etc/hsb/relay.conf"),
+            )?;
+        }
+        Distribuicao::Balanceador => {
+            println!("[5/8] Subindo o balanceador nginx L4...");
+            // O nginx resolve os nomes do upstream ao carregar, entao so da para
+            // validar agora, com os receptores ja no ar.
+            validar_nginx(exec, imagem)?;
+            podman::subir(
+                &container_meio,
+                imagem,
+                REDE,
+                apelido_meio,
+                &[
+                    Montagem::leitura(exec.conf.join("lb.conf"), "/etc/hsb/lb.conf"),
+                    Montagem::escrita(&exec.out, "/out"),
+                ],
+                &[
+                    "nginx".into(),
+                    "-c".into(),
+                    "/etc/hsb/lb.conf".into(),
+                ],
+            )?;
+        }
     }
-    podman::subir(
-        &format!("{PREFIXO}relay"),
-        imagem,
-        REDE,
-        "relay",
-        &montagens_relay,
-        &comando_rsyslog("/etc/hsb/relay.conf"),
-    )?;
+
     esperar_porta(
-        &format!("{PREFIXO}relay"),
+        &container_meio,
         PORTA_ENTRADA,
         false,
         Duration::from_secs(30),
-        "o relay abrir a porta TCP de entrada",
+        "a porta TCP de entrada abrir",
     )
-    .map_err(|e| diagnosticar(e, &format!("{PREFIXO}relay")))?;
+    .map_err(|e| diagnosticar(e, &container_meio))?;
     esperar_porta(
-        &format!("{PREFIXO}relay"),
+        &container_meio,
         PORTA_ENTRADA,
         true,
         Duration::from_secs(30),
-        "o relay abrir a porta UDP de entrada",
+        "a porta UDP de entrada abrir",
     )
-    .map_err(|e| diagnosticar(e, &format!("{PREFIXO}relay")))?;
-    println!("  · relay escutando em {PORTA_ENTRADA} (TCP e UDP)");
+    .map_err(|e| diagnosticar(e, &container_meio))?;
+    println!("  · {apelido_meio} escutando em {PORTA_ENTRADA} (TCP e UDP)");
 
     // ---- 6. Geradores ----
     println!("[6/8] Subindo {} geradores...", plano.len());
@@ -267,7 +358,7 @@ fn rodar_ciclo(
             REDE,
             &apelido,
             &[Montagem::escrita(&exec.out, "/out")],
-            &comando_gerador(cfg, p),
+            &comando_gerador(cfg, p, apelido_meio),
         )?;
         println!(
             "  · {} ({}) a {} msg/s em {} thread(s)",
@@ -293,8 +384,8 @@ fn rodar_ciclo(
     );
     dormir_interrompivel(cfg.teste.drenagem);
 
-    println!("  · parando relay e receptores...");
-    podman::parar(&format!("{PREFIXO}relay"), 10);
+    println!("  · parando {apelido_meio} e receptores...");
+    podman::parar(&container_meio, 10);
     for i in 1..=cfg.receptores.quantidade {
         podman::parar(&format!("{PREFIXO}recv-{i}"), 10);
     }
@@ -302,7 +393,35 @@ fn rodar_ciclo(
     std::thread::sleep(Duration::from_millis(500));
 
     // ---- Relatório ----
-    montar_relatorio(cfg, plano, exec)
+    montar_relatorio(cfg, plano, exec, distribuicao)
+}
+
+/// Roda `nginx -t` num container descartável na mesma rede, para que os nomes
+/// dos receptores no upstream resolvam.
+fn validar_nginx(exec: &Execucao, imagem: &str) -> Result<()> {
+    let caminho = exec.conf.join("lb.conf");
+    let saida = std::process::Command::new("podman")
+        .arg("run")
+        .arg("--rm")
+        .arg("--network")
+        .arg(REDE)
+        .arg("-v")
+        .arg(format!("{}:/etc/hsb/lb.conf:ro,Z", caminho.display()))
+        .arg(imagem)
+        .args(["nginx", "-t", "-c", "/etc/hsb/lb.conf"])
+        .output()
+        .context("falha ao validar a configuração com o nginx")?;
+
+    let texto = format!(
+        "{}{}",
+        String::from_utf8_lossy(&saida.stdout),
+        String::from_utf8_lossy(&saida.stderr)
+    );
+    if !saida.status.success() {
+        bail!("a configuração lb.conf não passou no nginx -t:\n{}", texto.trim());
+    }
+    println!("  · lb.conf validada pelo nginx -t");
+    Ok(())
 }
 
 fn comando_rsyslog(conf: &str) -> Vec<String> {
@@ -316,7 +435,7 @@ fn comando_rsyslog(conf: &str) -> Vec<String> {
     ]
 }
 
-fn comando_gerador(cfg: &Config, p: &GeradorPlano) -> Vec<String> {
+fn comando_gerador(cfg: &Config, p: &GeradorPlano, alvo: &str) -> Vec<String> {
     vec![
         "hugesyslogs".into(),
         "gerar".into(),
@@ -325,7 +444,7 @@ fn comando_gerador(cfg: &Config, p: &GeradorPlano) -> Vec<String> {
         "--proto".into(),
         p.proto.texto().into(),
         "--alvo".into(),
-        format!("relay:{PORTA_ENTRADA}"),
+        format!("{alvo}:{PORTA_ENTRADA}"),
         "--taxa".into(),
         p.taxa.to_string(),
         "--threads".into(),
@@ -395,7 +514,12 @@ fn diagnosticar(erro: anyhow::Error, container: &str) -> anyhow::Error {
     }
 }
 
-fn montar_relatorio(cfg: &Config, plano: &[GeradorPlano], exec: &Execucao) -> Result<()> {
+fn montar_relatorio(
+    cfg: &Config,
+    plano: &[GeradorPlano],
+    exec: &Execucao,
+    distribuicao: Distribuicao,
+) -> Result<()> {
     let mut envios = Vec::new();
     let mut inicio_medicao: BTreeMap<String, i128> = BTreeMap::new();
 
@@ -431,7 +555,12 @@ fn montar_relatorio(cfg: &Config, plano: &[GeradorPlano], exec: &Execucao) -> Re
     }
 
     let ag = metricas::coletar(&exec.out, cfg.receptores.quantidade, &inicio_medicao)?;
-    let conf = metricas::conferir(&exec.out);
+    // O impstats vem do rsyslog do relay; sob o balanceador nginx nao existe equivalente.
+    let conf = if distribuicao == Distribuicao::Rsyslog {
+        metricas::conferir(&exec.out)
+    } else {
+        metricas::Conferencia::default()
+    };
 
     let tamanho_medio = if plano.is_empty() {
         cfg.teste.tamanho_mensagem
@@ -444,7 +573,13 @@ fn montar_relatorio(cfg: &Config, plano: &[GeradorPlano], exec: &Execucao) -> Re
         relatorio::imprimir_tabelas(cfg, plano, &envios, &ag, &conf, &resumo);
     }
     if cfg.saida.formato.quer_json() {
-        let json = relatorio::montar_json(cfg, plano, &envios, &ag, &conf, &resumo);
+        let mut json = relatorio::montar_json(cfg, plano, &envios, &ag, &conf, &resumo);
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "distribuicao".into(),
+                serde_json::Value::String(distribuicao.texto().into()),
+            );
+        }
         let destino = exec.raiz.join("relatorio.json");
         std::fs::write(&destino, serde_json::to_string_pretty(&json)?)?;
         println!("Relatório JSON: {}", destino.display());

@@ -1,5 +1,6 @@
 //! HugeSyslogs — testes de desempenho e balanceamento de relay rsyslog em round-robin.
 
+mod balanceador;
 mod certs;
 mod config;
 mod gerador;
@@ -40,6 +41,9 @@ enum Comando {
         config: PathBuf,
         #[arg(long, default_value = IMAGEM_PADRAO)]
         imagem: String,
+        /// Valida também a configuração do balanceador nginx.
+        #[arg(long)]
+        balanceador: bool,
     },
     /// Constrói a imagem de container usada pelos três papéis.
     Imagem {
@@ -55,6 +59,12 @@ enum Comando {
         /// Não remove os containers ao final, para inspeção.
         #[arg(long)]
         manter: bool,
+        /// Troca o relay rsyslog por um balanceador nginx L4 com hash de 5 tuplas.
+        ///
+        /// A distribuição passa a ser por conexão em vez de por mensagem, e o
+        /// tráfego até os receptores vai em texto puro, sem TLS.
+        #[arg(long)]
+        balanceador: bool,
     },
     /// Remove containers e rede deixados para trás.
     Limpar,
@@ -85,15 +95,25 @@ fn executar() -> Result<()> {
     }
 
     match cli.comando {
-        Comando::Validar { config, imagem } => validar(&config, &imagem),
+        Comando::Validar {
+            config,
+            imagem,
+            balanceador,
+        } => validar(&config, &imagem, balanceador),
         Comando::Imagem { imagem } => construir_imagem(&imagem),
         Comando::Executar {
             config,
             imagem,
             manter,
+            balanceador,
         } => {
             let cfg = config::Config::carregar(&config)?;
-            let r = orquestrador::executar(&cfg, &imagem, manter);
+            let distribuicao = if balanceador {
+                orquestrador::Distribuicao::Balanceador
+            } else {
+                orquestrador::Distribuicao::Rsyslog
+            };
+            let r = orquestrador::executar(&cfg, &imagem, manter, distribuicao);
             if INTERROMPIDO.load(Ordering::Relaxed) {
                 orquestrador::limpar(true);
             }
@@ -109,11 +129,17 @@ fn executar() -> Result<()> {
     }
 }
 
-fn validar(caminho: &Path, imagem: &str) -> Result<()> {
+fn validar(caminho: &Path, imagem: &str, balanceador: bool) -> Result<()> {
     let cfg = config::Config::carregar(caminho)?;
     let plano = cfg.plano();
+    let distribuicao = if balanceador {
+        orquestrador::Distribuicao::Balanceador
+    } else {
+        orquestrador::Distribuicao::Rsyslog
+    };
 
     println!("Configuração válida: {}", caminho.display());
+    println!("Distribuição: {}", distribuicao.texto());
     println!(
         "\nDuração {}s (aquecimento {}s, drenagem {}s)",
         relatorio::dec(cfg.teste.duracao.as_secs_f64(), 0),
@@ -157,8 +183,8 @@ fn validar(caminho: &Path, imagem: &str) -> Result<()> {
 
     // A validação do rsyslogd precisa da imagem; sem ela, só as confs são escritas.
     let exec = orquestrador::Execucao::criar(&cfg.saida.diretorio.join("validacao"))?;
-    println!("\n=== CONFIGURAÇÕES RSYSLOG ===");
-    orquestrador::gerar_e_validar_confs(&cfg, &exec, imagem)?;
+    println!("\n=== CONFIGURAÇÕES ===");
+    orquestrador::gerar_e_validar_confs(&cfg, &exec, imagem, distribuicao)?;
     println!("  · gravadas em {}", exec.conf.display());
 
     Ok(())

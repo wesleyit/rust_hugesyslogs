@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use hdrhistogram::Histogram;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -18,6 +18,10 @@ pub struct EstatReceptor {
     pub nome: String,
     pub recebidas: u64,
     pub por_gerador: BTreeMap<String, u64>,
+    /// Pares (gerador, thread) vistos. Sob um balanceador de 5 tuplas, cada par
+    /// e uma conexao presa a este receptor.
+    pub conexoes: BTreeSet<(String, u32)>,
+    pub por_transporte: BTreeMap<String, u64>,
     pub latencia: Histogram<u64>,
 }
 
@@ -27,6 +31,8 @@ impl EstatReceptor {
             nome,
             recebidas: 0,
             por_gerador: BTreeMap::new(),
+            conexoes: BTreeSet::new(),
+            por_transporte: BTreeMap::new(),
             latencia: Histogram::new_with_bounds(1, LATENCIA_MAXIMA_US, 3)
                 .context("não foi possível criar o histograma de latência")?,
         })
@@ -47,6 +53,8 @@ pub struct Agregado {
     pub recebidas_por_gerador: BTreeMap<String, u64>,
     /// Contagem por par (origem, relay), como visto pelos receptores.
     pub origens: BTreeMap<(String, String), u64>,
+    /// Contagem por listener de entrada: tls, tcp ou udp.
+    pub por_transporte: BTreeMap<String, u64>,
     /// Mensagens descartadas por caírem na janela de aquecimento.
     pub descartadas_aquecimento: u64,
     /// Linhas que não puderam ser interpretadas.
@@ -59,6 +67,8 @@ struct Campos<'a> {
     gerador: &'a str,
     origem: &'a str,
     relay: &'a str,
+    transporte: &'a str,
+    thread: u32,
     envio_ns: i128,
 }
 
@@ -66,16 +76,22 @@ fn extrair(corpo: &str) -> Option<Campos<'_>> {
     let mut gerador = None;
     let mut origem = "?";
     let mut relay = "?";
+    let mut transporte = "?";
+    let mut thread = 0u32;
     let mut envio_ns = None;
     for token in corpo.split_ascii_whitespace() {
-        if let Some(v) = token.strip_prefix("g=") {
+        if let Some(v) = token.strip_prefix("gerador=") {
             gerador = Some(v);
-        } else if let Some(v) = token.strip_prefix("t=") {
+        } else if let Some(v) = token.strip_prefix("envio_ns=") {
             envio_ns = v.parse::<i128>().ok();
+        } else if let Some(v) = token.strip_prefix("thread=") {
+            thread = v.parse().unwrap_or(0);
         } else if let Some(v) = token.strip_prefix("origem=") {
             origem = v;
         } else if let Some(v) = token.strip_prefix("relay=") {
             relay = v;
+        } else if let Some(v) = token.strip_prefix("transporte=") {
+            transporte = v;
         } else if gerador.is_some() && envio_ns.is_some() {
             // O padding vem depois dos campos de medição; nada mais a procurar.
             break;
@@ -85,6 +101,8 @@ fn extrair(corpo: &str) -> Option<Campos<'_>> {
         gerador: gerador?,
         origem,
         relay,
+        transporte,
+        thread,
         envio_ns: envio_ns?,
     })
 }
@@ -172,6 +190,14 @@ pub fn coletar(
                 .or_insert(0) += 1;
             *ag.origens
                 .entry((campos.origem.to_string(), campos.relay.to_string()))
+                .or_insert(0) += 1;
+            est.conexoes
+                .insert((campos.gerador.to_string(), campos.thread));
+            *est.por_transporte
+                .entry(campos.transporte.to_string())
+                .or_insert(0) += 1;
+            *ag.por_transporte
+                .entry(campos.transporte.to_string())
                 .or_insert(0) += 1;
         }
 

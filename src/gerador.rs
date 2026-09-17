@@ -139,6 +139,7 @@ pub fn executar(args: ArgsGerador) -> Result<()> {
             trabalhar(
                 &args,
                 &origem,
+                i,
                 endereco,
                 taxa_thread,
                 cota_total,
@@ -251,6 +252,7 @@ impl Canal {
 fn trabalhar(
     args: &ArgsGerador,
     origem: &str,
+    thread: usize,
     endereco: std::net::SocketAddr,
     taxa: u64,
     cota: u64,
@@ -315,7 +317,7 @@ fn trabalhar(
             }
             let seq = sequencia.fetch_add(1, Ordering::Relaxed);
             let agora = agora_ns();
-            montar(&mut quadro, args, origem, seq, agora, &enchimento);
+            montar(&mut quadro, args, origem, thread, seq, agora, &enchimento);
 
             match canal.enviar(&quadro) {
                 Ok(n) => {
@@ -348,11 +350,14 @@ fn trabalhar(
 /// Monta um frame RFC5424 com exatamente `args.tamanho` bytes.
 ///
 /// `origem` vai no campo HOSTNAME, que o relay preserva ao encaminhar. Os campos de
-/// medição vêm no início do corpo para caberem no recorte `%msg:1:90%` do receptor.
+/// medição vêm no início do corpo para caberem no recorte que o receptor grava.
+/// `thread` identifica a conexão: sob um balanceador de 5 tuplas, cada thread tem
+/// seu próprio socket e portanto fica presa a um único receptor.
 fn montar(
     quadro: &mut String,
     args: &ArgsGerador,
     origem: &str,
+    thread: usize,
     seq: u64,
     agora: i128,
     enchimento: &str,
@@ -361,7 +366,7 @@ fn montar(
     let ts = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
     let _ = write!(
         quadro,
-        "<134>1 {ts} {origem} hsb - - - g={nome} s={seq} t={agora}",
+        "<134>1 {ts} {origem} hsb - - - gerador={nome} thread={thread} sequencia={seq} envio_ns={agora}",
         nome = args.nome
     );
 

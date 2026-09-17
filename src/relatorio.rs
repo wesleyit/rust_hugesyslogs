@@ -294,6 +294,59 @@ pub fn imprimir_tabelas(
         }
     }
 
+    // ---- Conexões por receptor ----
+    println!();
+    println!("=== CONEXÕES POR RECEPTOR (pares gerador/thread distintos) ===");
+    println!(
+        "{:<10} {:>9} {:>12} {:>9}  quais",
+        "receptor", "conexões", "mensagens", "fatia"
+    );
+    for r in &ag.receptores {
+        let fatia = if resumo.recebidas > 0 {
+            r.recebidas as f64 / resumo.recebidas as f64 * 100.0
+        } else {
+            0.0
+        };
+        let quais = if r.conexoes.is_empty() {
+            "—".to_string()
+        } else {
+            let lista: Vec<String> = r
+                .conexoes
+                .iter()
+                .take(6)
+                .map(|(g, t)| format!("{g}/{t}"))
+                .collect();
+            let mut txt = lista.join(" ");
+            if r.conexoes.len() > 6 {
+                txt.push_str(&format!(" +{}", r.conexoes.len() - 6));
+            }
+            txt
+        };
+        println!(
+            "{:<10} {:>9} {:>12} {:>9}  {}",
+            r.nome,
+            r.conexoes.len(),
+            num(r.recebidas),
+            pct(fatia),
+            quais
+        );
+    }
+
+    // ---- Transporte ----
+    if ag.por_transporte.len() > 1 || !ag.por_transporte.is_empty() {
+        println!();
+        println!("=== POR TRANSPORTE ===");
+        println!("{:<12} {:>12} {:>9}", "transporte", "mensagens", "fatia");
+        for (t, n) in &ag.por_transporte {
+            let fatia = if resumo.recebidas > 0 {
+                *n as f64 / resumo.recebidas as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!("{:<12} {:>12} {:>9}", t, num(*n), pct(fatia));
+        }
+    }
+
     // ---- Avisos ----
     let mut avisos: Vec<String> = Vec::new();
     for e in envios {
@@ -379,6 +432,12 @@ pub fn montar_json(
                 "recebidas": r.recebidas,
                 "fatia_pct": fatia,
                 "desvio_pct": fatia - ideal,
+                "conexoes": r.conexoes.len(),
+                "conexoes_detalhe": r.conexoes
+                    .iter()
+                    .map(|(g, t)| format!("{g}/{t}"))
+                    .collect::<Vec<_>>(),
+                "por_transporte": r.por_transporte,
                 "latencia_us": {
                     "p50": r.percentil_us(0.50),
                     "p90": r.percentil_us(0.90),
@@ -447,6 +506,7 @@ pub fn montar_json(
         "receptores": receptores,
         "geradores": geradores,
         "origens": origens,
+        "por_transporte": ag.por_transporte,
         "conferencia": {
             "disponivel": conf.disponivel,
             "recebidas_relay": conf.recebidas_relay,

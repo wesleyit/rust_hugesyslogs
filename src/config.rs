@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Menor tamanho de mensagem que ainda comporta o cabeçalho RFC5424 e os campos de medição.
-pub const TAMANHO_MINIMO: usize = 128;
+///
+/// Pior caso: 7 (PRI+versão) + 27 (timestamp) + 16 (hostname) + 11 (campos vazios)
+/// + 87 (gerador, thread, sequencia, envio_ns) = 148 bytes.
+pub const TAMANHO_MINIMO: usize = 192;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
